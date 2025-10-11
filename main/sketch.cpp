@@ -6,6 +6,74 @@
 
 #include <Arduino.h>
 #include <Bluepad32.h>
+#include <MotorCtrl.hpp>
+#include <Wire.h>
+#include <protocentral_TLA20xx.h>
+
+// Motor Control Configuration
+#define MOTOR_ID 1
+#define CAN_TX_PIN GPIO_NUM_1
+#define CAN_RX_PIN GPIO_NUM_2
+#define MOTOR_OFFSET -1.0471975512  // Motor offset for position correction
+
+// ADC / Hall Sensor Configuration
+#define TLA20XX_I2C_ADDR 0x48  // Default I2C address for TLA2024
+#define SDA GPIO_NUM_8        // I2C SDA pin
+#define SCL GPIO_NUM_7        // I2C SCL pin
+#define ADC_CHANNEL_VOLTAGE 0
+#define ADC_CHANNEL_CURRENT 1
+#define ADC_CHANNEL_HALL 2
+
+// Motor Control Variables
+Motor motor;
+ButterworthFilter positionFilter(20, 100);  // 20Hz cutoff, 100Hz sampling rate
+Motor_state motorState;
+bool motorRunning = false;
+bool motorCalibrated = false;
+float targetPosition = 0.0;
+float targetVelocity = 0.0;
+float commandKp = 2.0;
+float commandKd = 0.1;
+bool enableFilter = false; // true;
+
+// Hall sensor / ADC monitoring
+TLA20XX tla2024(TLA20XX_I2C_ADDR);
+float monitoredValue = 0.0;
+uint8_t currentADCChannel = ADC_CHANNEL_HALL;
+
+// ADC Helper Functions
+void setADCChannel(uint8_t channel) {
+    if (channel == ADC_CHANNEL_VOLTAGE) {
+        tla2024.setMux(TLA20XX::MUX_AIN0_GND);
+    } else if (channel == ADC_CHANNEL_CURRENT) {
+        tla2024.setMux(TLA20XX::MUX_AIN1_GND);
+    } else if (channel == ADC_CHANNEL_HALL) {
+        tla2024.setMux(TLA20XX::MUX_AIN2_GND);
+    }
+    delay(10);  // Wait for channel switch
+}
+
+void initADC() {
+    Console.println("Initializing TLA2024 ADC...");
+    Wire.setPins(SDA, SCL);
+    Wire.begin();
+    delay(100);
+    
+    tla2024.begin();
+    tla2024.setMode(TLA20XX::OP_CONTINUOUS);
+    tla2024.setDR(TLA20XX::DR_3300SPS);
+    tla2024.setFSR(TLA20XX::FSR_4_096V);
+    
+    // Set default channel to hall sensor
+    setADCChannel(ADC_CHANNEL_HALL);
+    delay(100);
+    
+    Console.println("ADC initialized");
+}
+
+void updateMonitoredValue() {
+    monitoredValue = tla2024.read_adc();
+}
 
 //
 // README FIRST, README FIRST, README FIRST
@@ -22,6 +90,154 @@
 //    CONFIG_BLUEPAD32_USB_CONSOLE_ENABLE=n
 
 ControllerPtr myControllers[BP32_MAX_GAMEPADS];
+
+// Motor Control Helper Functions
+void initMotor() {
+    Console.println("Initializing motor...");
+    motor.Init(MOTOR_ID, CAN_TX_PIN, CAN_RX_PIN);
+    motor.Set_mode(Motor_mode::Motion);
+    motor.Set_parameter(Motor_param::limit_cur, 27.0F);
+    Console.println("Motor initialized");
+}
+
+void enableMotor() {
+    if (!motorRunning) {
+        Console.println("Enabling motor...");
+        motorState = motor.Enable();
+        motorRunning = true;
+        Console.println("Motor enabled");
+    }
+}
+
+void disableMotor() {
+    if (motorRunning) {
+        Console.println("Disabling motor...");
+        motorState = motor.Disable();
+        motorRunning = false;
+        Console.println("Motor disabled");
+    }
+}
+
+bool checkMotorSafety() {
+    if (!motorCalibrated) {
+        Console.println("Motor not calibrated!");
+        return false;
+    }
+    return true;
+}
+
+void moveToMiddle() {
+    Console.println("Moving to middle position...");
+    enableMotor();
+    for (float i = 0; i <= PI/2; i += 0.01) {
+        float filteredPos = enableFilter ? positionFilter.filter(-MOTOR_OFFSET * cos(i)) : -MOTOR_OFFSET * cos(i);
+        motorState = motor.Set_control(0, filteredPos, 0, 20, 0.5);
+        delay(10);
+    }
+    Console.println("Reached middle position");
+}
+
+// Spin motor until threshold is reached (for calibration)
+float spinUntilThreshold(float targetValue, float speed, bool reverse = false) {
+    float motorAngleSum = 0.0F;
+    float motorTempVal = 0.0F;
+    
+    motorState = motor.Set_control(0, 0, reverse ? -speed : speed, 0, 40);
+    
+    Console.printf("Spinning %s, waiting for hall sensor >= %.1f...\n", 
+                   reverse ? "reverse" : "forward", targetValue);
+    
+    // Wait until monitored_value is below the target threshold
+    while (monitoredValue < targetValue) {
+        delay(1);
+        updateMonitoredValue();
+        motorTempVal = motor.Get_state().angle;
+    }
+    motorAngleSum += motorTempVal;
+    Console.printf("Hall sensor reached %.1f, angle: %.3f\n", monitoredValue, motorTempVal);
+
+    // Wait until monitored_value exceeds a secondary threshold for finer control
+    while (monitoredValue > targetValue - 20) {
+        delay(1);
+        updateMonitoredValue();
+        motorTempVal = motor.Get_state().angle;
+    }
+    motorAngleSum += motorTempVal;
+    Console.printf("Hall sensor stabilized at %.1f, angle: %.3f\n", monitoredValue, motorTempVal);
+    
+    return motorAngleSum;
+}
+
+// Main function to align motor and set zero position using hall sensor
+void alignMotorAndSetZero(Motor &motor, float hall_threshold, float speed = 0.5F) {
+    Console.printf("Aligning motor with hall threshold: %.1f, speed: %.2f\n", hall_threshold, speed);
+    float motor_total = 0.0F;
+
+    // Spin motor in the forward direction
+    Console.println("Spinning forward...");
+    motor_total += spinUntilThreshold(hall_threshold, speed);
+
+    // Pause before reversing
+    delay(500);
+
+    // Spin motor in the reverse direction
+    Console.println("Spinning reverse...");
+    motor_total += spinUntilThreshold(hall_threshold, speed, true);
+
+    // Average the total motor angle and set position
+    Console.printf("Setting position to averaged angle: %.3f\n", motor_total / 4.0F);
+    motorState = motor.Set_control(0, motor_total / 4.0F, 0, 20, 0.5);
+    delay(1000);
+
+    // Disable motor and set zero position
+    disableMotor();
+    motorState = motor.Set_zero();
+    Console.println("Motor aligned and zero position set");
+}
+
+void autoCalibrate() {
+    Console.println("Starting auto-calibration...");
+    
+    disableMotor();
+    delay(100);
+    
+    // Set ADC to hall sensor channel
+    setADCChannel(ADC_CHANNEL_HALL);
+    delay(100);
+    
+    // Check initial hall sensor reading
+    updateMonitoredValue();
+    Console.printf("Initial hall sensor reading: %.1f\n", monitoredValue);
+    
+    // Reinitialize motor
+    initMotor();
+    motorState = motor.Set_zero();
+    delay(100);
+    
+    enableMotor();
+    
+    // Align motor using hall sensor threshold
+    alignMotorAndSetZero(motor, 940, 0.5);
+
+    delay(100);
+    
+    motorCalibrated = true;
+    Console.println("Calibration complete!");
+    
+    // Switch back to voltage monitoring
+    setADCChannel(ADC_CHANNEL_VOLTAGE);
+    
+    // Move to middle position if offset is set
+    if (MOTOR_OFFSET != 0) {
+        moveToMiddle();
+    }
+}
+
+void stepMotor(float targetAngle, float targetVel, float kp, float kd) {
+    if (checkMotorSafety()) {
+        motorState = motor.Set_control(0, targetAngle + MOTOR_OFFSET, targetVel, kp, kd);
+    }
+}
 
 // This callback gets called any time a new gamepad is connected.
 // Up to 4 gamepads can be connected at the same time.
@@ -147,55 +363,86 @@ void dumpBalanceBoard(ControllerPtr ctl) {
 }
 
 void processGamepad(ControllerPtr ctl) {
-    // There are different ways to query whether a button is pressed.
-    // By query each button individually:
-    //  a(), b(), x(), y(), l1(), etc...
+    // Motor control with gamepad buttons
+    
+    // A button: Toggle motor on/off
     if (ctl->a()) {
-        static int colorIdx = 0;
-        // Some gamepads like DS4 and DualSense support changing the color LED.
-        // It is possible to change it by calling:
-        switch (colorIdx % 3) {
-            case 0:
-                // Red
-                ctl->setColorLED(255, 0, 0);
-                break;
-            case 1:
-                // Green
-                ctl->setColorLED(0, 255, 0);
-                break;
-            case 2:
-                // Blue
-                ctl->setColorLED(0, 0, 255);
-                break;
+        if (motorRunning) {
+            disableMotor();
+        } else {
+            enableMotor();
         }
-        colorIdx++;
+        delay(300);  // Debounce
     }
 
+    // B button: Run calibration
     if (ctl->b()) {
-        // Turn on the 4 LED. Each bit represents one LED.
-        static int led = 0;
-        led++;
-        // Some gamepads like the DS3, DualSense, Nintendo Wii, Nintendo Switch
-        // support changing the "Player LEDs": those 4 LEDs that usually indicate
-        // the "gamepad seat".
-        // It is possible to change them by calling:
-        ctl->setPlayerLEDs(led & 0x0f);
+        Console.println("Calibration requested via gamepad");
+        autoCalibrate();
+        delay(300);  // Debounce
     }
 
+    // X button: Set current position as zero
     if (ctl->x()) {
-        // Some gamepads like DS3, DS4, DualSense, Switch, Xbox One S, Stadia support rumble.
-        // It is possible to set it by calling:
-        // Some controllers have two motors: "strong motor", "weak motor".
-        // It is possible to control them independently.
-        ctl->playDualRumble(0 /* delayedStartMs */, 250 /* durationMs */, 0x80 /* weakMagnitude */,
-                            0x40 /* strongMagnitude */);
+        Console.println("Setting zero position");
+        motorState = motor.Set_zero();
+        motorCalibrated = true;
+        delay(300);  // Debounce
     }
 
-    // Another way to query controller data is by getting the buttons() function.
-    // See how the different "dump*" functions dump the Controller info.
-    dumpGamepad(ctl);
+    // Y button: Move to middle position
+    if (ctl->y()) {
+        if (motorCalibrated) {
+            moveToMiddle();
+        }
+        delay(300);  // Debounce
+    }
 
-    // See ArduinoController.h for all the available functions.
+    // Use left joystick for position control
+    if (motorRunning && motorCalibrated) {
+        // Map joystick X axis (-511 to 512) to position (-PI to PI)
+        int axisX = ctl->axisX();
+        int axisY = ctl->axisY();
+        
+        // Add deadzone
+        if (abs(axisX) > 50 || abs(axisY) > 50) {
+            targetPosition = (float)axisX / 512.0 * PI;
+            // targetVelocity = -(float)axisY / 512.0 * 10.0;  // Max 10 rad/s
+            targetVelocity = 0;
+            
+            Console.printf("Target Pos: %.2f, Vel: %.2f\n", targetPosition, targetVelocity);
+        } else {
+            targetPosition = 0;
+            targetVelocity = 0;
+        }
+        
+        // // Use R1/R2 to adjust Kp
+        // if (ctl->r1()) {
+        //     commandKp += 0.5;
+        //     Console.printf("Kp increased to: %.1f\n", commandKp);
+        //     delay(100);
+        // }
+        // if (ctl->r2()) {
+        //     commandKp = max(0.0f, commandKp - 0.5);
+        //     Console.printf("Kp decreased to: %.1f\n", commandKp);
+        //     delay(100);
+        // }
+        
+        // // Use L1/L2 to adjust Kd
+        // if (ctl->l1()) {
+        //     commandKd += 0.1;
+        //     Console.printf("Kd increased to: %.2f\n", commandKd);
+        //     delay(100);
+        // }
+        // if (ctl->l2()) {
+        //     commandKd = max(0.0f, commandKd - 0.1);
+        //     Console.printf("Kd decreased to: %.2f\n", commandKd);
+        //     delay(100);
+        // }
+    }
+
+    // Optional: still show gamepad data
+    // dumpGamepad(ctl);
 }
 
 void processMouse(ControllerPtr ctl) {
@@ -272,6 +519,7 @@ void setup() {
     const uint8_t* addr = BP32.localBdAddress();
     Console.printf("BD Addr: %2X:%2X:%2X:%2X:%2X:%2X\n", addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
 
+    set_led_color(240, 255, 0);
     // Setup the Bluepad32 callbacks, and the default behavior for scanning or not.
     // By default, if the "startScanning" parameter is not passed, it will do the "start scanning".
     // Notice that "Start scanning" will try to auto-connect to devices that are compatible with Bluepad32.
@@ -300,15 +548,60 @@ void setup() {
     // This service allows clients, like a mobile app, to setup and see the state of Bluepad32.
     // By default, it is disabled.
     BP32.enableBLEService(false);
+
+    // ===== MOTOR INITIALIZATION =====
+    Console.println("\n===== Starting Motor Initialization =====");
+    delay(1000);  // Wait for system to stabilize
+    
+    // Initialize ADC for hall sensor
+    initADC();
+    delay(500);
+    
+    // Initialize motor
+    initMotor();
+    delay(500);
+    
+    // Run auto-calibration
+    Console.println("Starting auto-calibration sequence...");
+    autoCalibrate();
+    
+    Console.println("===== Motor Setup Complete =====");
+    Console.println("Control the motor with your gamepad:");
+    Console.println("  A: Toggle motor on/off");
+    Console.println("  B: Run calibration");
+    Console.println("  X: Set current position as zero");
+    Console.println("  Y: Move to middle position");
+    Console.println("  Left Stick: Position (X) and Velocity (Y) control");
+    Console.println("  R1/R2: Adjust Kp gain");
+    Console.println("  L1/L2: Adjust Kd gain");
 }
 
 // Arduino loop function. Runs in CPU 1.
 void loop() {
+    // Update monitored value from ADC
+    updateMonitoredValue();
+    
     // This call fetches all the controllers' data.
     // Call this function in your main loop.
     bool dataUpdated = BP32.update();
     if (dataUpdated)
         processControllers();
+
+    // Update motor with filtered position if motor is running
+    if (motorRunning && motorCalibrated) {
+        float filteredPos = enableFilter ? positionFilter.filter(targetPosition) : targetPosition;
+        stepMotor(filteredPos, targetVelocity, commandKp, commandKd);
+        
+        // Get and display motor state periodically
+        static unsigned long lastPrint = 0;
+        if (millis() - lastPrint > 500) {  // Print every 500ms
+            motorState = motor.Get_state();
+            Console.printf("Motor - Pos: %.3f, Vel: %.3f, Torque: %.3f, Temp: %.1f, Hall: %.1f\n", 
+                         motorState.angle, motorState.angle_v, motorState.torque, 
+                         motorState.temperature, monitoredValue);
+            lastPrint = millis();
+        }
+    }
 
     // The main loop must have some kind of "yield to lower priority task" event.
     // Otherwise, the watchdog will get triggered.
@@ -316,6 +609,5 @@ void loop() {
     // Detailed info here:
     // https://stackoverflow.com/questions/66278271/task-watchdog-got-triggered-the-tasks-did-not-reset-the-watchdog-in-time
 
-    //     vTaskDelay(1);
-    delay(150);
+    delay(20);  // 50Hz update rate
 }

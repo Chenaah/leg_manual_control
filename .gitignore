@@ -1,3 +1,5 @@
+managed_components/
+
 # esp-idf
 sdkconfig.old
 sdkconfig
