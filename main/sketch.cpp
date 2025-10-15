@@ -10,6 +10,11 @@
 #include <Wire.h>
 #include <protocentral_TLA20xx.h>
 
+// Include Bluepad32 allowlist functions
+extern "C" {
+    #include "bt/uni_bt_allowlist.h"
+}
+
 // Motor Control Configuration
 #define MOTOR_ID 1
 #define CAN_TX_PIN GPIO_NUM_1
@@ -32,8 +37,8 @@ bool motorRunning = false;
 bool motorCalibrated = false;
 float targetPosition = 0.0;
 float targetVelocity = 0.0;
-float commandKp = 2.0;
-float commandKd = 0.1;
+float commandKp = 8.0;
+float commandKd = 0.2;
 bool enableFilter = false; // true;
 
 // Hall sensor / ADC monitoring
@@ -130,8 +135,8 @@ void moveToMiddle() {
     Console.println("Moving to middle position...");
     enableMotor();
     for (float i = 0; i <= PI/2; i += 0.01) {
-        float filteredPos = enableFilter ? positionFilter.filter(-MOTOR_OFFSET * cos(i)) : -MOTOR_OFFSET * cos(i);
-        motorState = motor.Set_control(0, filteredPos, 0, 20, 0.5);
+        float filteredPos = -MOTOR_OFFSET * cos(i);
+        motorState = motor.Set_control(0, MOTOR_OFFSET+filteredPos, 0, 20, 0.5);
         delay(10);
     }
     Console.println("Reached middle position");
@@ -537,6 +542,21 @@ void setup() {
     // But it might also fix some connection / re-connection issues.
     BP32.forgetBluetoothKeys();
 
+    // ===== CONFIGURE ALLOWLIST TO ONLY CONNECT TO SPECIFIC CONTROLLER =====
+    // Your controller's MAC address: 40:8E:2C:6C:EC:CF
+    bd_addr_t allowed_controller = {0x40, 0x8E, 0x2C, 0x6C, 0xEC, 0xCF};
+    
+    // Clear any existing allowlist entries
+    uni_bt_allowlist_remove_all();
+    
+    // Add your controller to the allowlist
+    uni_bt_allowlist_add_addr(allowed_controller);
+    
+    // Enable the allowlist feature
+    uni_bt_allowlist_set_enabled(true);
+    
+    Console.println("Bluetooth allowlist enabled - only controller 40:8E:2C:6C:EC:CF can connect");
+    
     // Enables mouse / touchpad support for gamepads that support them.
     // When enabled, controllers like DualSense and DualShock4 generate two connected devices:
     // - First one: the gamepad
