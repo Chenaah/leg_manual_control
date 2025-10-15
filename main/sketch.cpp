@@ -19,6 +19,8 @@ extern "C" {
 #define MOTOR_ID 1
 #define CAN_TX_PIN GPIO_NUM_1
 #define CAN_RX_PIN GPIO_NUM_2
+#define MOTOR_SWITCH GPIO_NUM_38
+
 #define MOTOR_OFFSET -1.0471975512  // Motor offset for position correction
 
 // ADC / Hall Sensor Configuration
@@ -40,6 +42,17 @@ float targetVelocity = 0.0;
 float commandKp = 8.0;
 float commandKd = 0.2;
 bool enableFilter = false; // true;
+
+// Motor Crash Detection Variables
+float lastTargetPosition = 0.0;
+float lastMotorAngle = 0.0;
+unsigned long lastAngleChangeTime = 0;
+unsigned long crashDetectionStartTime = 0;
+const unsigned long CRASH_DETECTION_TIMEOUT = 2000;  // 2 seconds
+const float POSITION_CHANGE_THRESHOLD = 0.05;  // Minimum position change to consider movement
+const float ANGLE_CHANGE_THRESHOLD = 0.02;     // Minimum angle change to detect motor movement
+const float TORQUE_ABNORMAL_THRESHOLD = 25.0;  // Maximum normal torque
+const float TEMPERATURE_LIMIT = 80.0;          // Temperature warning limit
 
 // Hall sensor / ADC monitoring
 TLA20XX tla2024(TLA20XX_I2C_ADDR);
@@ -242,6 +255,72 @@ void stepMotor(float targetAngle, float targetVel, float kp, float kd) {
     if (checkMotorSafety()) {
         motorState = motor.Set_control(0, targetAngle + MOTOR_OFFSET, targetVel, kp, kd);
     }
+    if (((motorState.error_state >> 6) & 0x03) == 0) {
+        digitalWrite(MOTOR_SWITCH, HIGH); // Turn off motor switch on critical error
+        delay(500);
+        esp_restart();
+    }
+}
+
+// Motor Crash Detection Function
+bool detectMotorCrash() {
+    // Get current motor state
+    motorState = motor.Get_state();
+    
+    // Check 1: Temperature limit exceeded
+    if (motorState.temperature > TEMPERATURE_LIMIT) {
+        Console.printf("CRASH DETECTED: Temperature too high (%.1f°C)\n", motorState.temperature);
+        return true;
+    }
+    
+    // Check 2: Torque abnormally high (motor stalled/blocked)
+    if (abs(motorState.torque) > TORQUE_ABNORMAL_THRESHOLD) {
+        Console.printf("CRASH DETECTED: Abnormal torque (%.2f)\n", motorState.torque);
+        return true;
+    }
+    
+    // Check 3: Target position is changing but motor angle is not responding
+    float targetChange = abs(targetPosition - lastTargetPosition);
+    float angleChange = abs(motorState.angle - lastMotorAngle);
+    
+    // If target position changed significantly
+    if (targetChange > POSITION_CHANGE_THRESHOLD) {
+        if (crashDetectionStartTime == 0) {
+            // Start tracking
+            crashDetectionStartTime = millis();
+        }
+        
+        // Check if motor angle changed
+        if (angleChange > ANGLE_CHANGE_THRESHOLD) {
+            // Motor is responding, reset detection
+            crashDetectionStartTime = 0;
+            lastAngleChangeTime = millis();
+        } else {
+            // Motor not responding, check timeout
+            if (millis() - crashDetectionStartTime > CRASH_DETECTION_TIMEOUT) {
+                Console.printf("CRASH DETECTED: Target changed (%.3f -> %.3f) but motor stuck at %.3f\n",
+                             lastTargetPosition, targetPosition, motorState.angle);
+                return true;
+            }
+        }
+    }
+    // Note: Don't reset timer when target stops - keep monitoring until motor responds
+    
+    // Update last values for next iteration
+    lastTargetPosition = targetPosition;
+    lastMotorAngle = motorState.angle;
+    
+    return false;
+}
+
+void handleMotorCrash() {
+    Console.println("====================================");
+    Console.println("MOTOR CRASH DETECTED - RESTARTING!");
+    Console.println("====================================");
+    // delay(1000);  // Give time to print message
+    digitalWrite(MOTOR_SWITCH, HIGH); // Turn off motor switch on critical error
+    delay(500);
+    esp_restart();
 }
 
 // This callback gets called any time a new gamepad is connected.
@@ -525,6 +604,11 @@ void setup() {
     Console.printf("BD Addr: %2X:%2X:%2X:%2X:%2X:%2X\n", addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
 
     set_led_color(240, 255, 0);
+
+    pinMode(MOTOR_SWITCH, OUTPUT);
+    digitalWrite(MOTOR_SWITCH, LOW); // Turn on motor
+
+
     // Setup the Bluepad32 callbacks, and the default behavior for scanning or not.
     // By default, if the "startScanning" parameter is not passed, it will do the "start scanning".
     // Notice that "Start scanning" will try to auto-connect to devices that are compatible with Bluepad32.
@@ -611,6 +695,11 @@ void loop() {
     if (motorRunning && motorCalibrated) {
         float filteredPos = enableFilter ? positionFilter.filter(targetPosition) : targetPosition;
         stepMotor(filteredPos, targetVelocity, commandKp, commandKd);
+        
+        // Check for motor crash conditions
+        if (detectMotorCrash()) {
+            handleMotorCrash();
+        }
         
         // Get and display motor state periodically
         static unsigned long lastPrint = 0;
