@@ -482,22 +482,37 @@ void processGamepad(ControllerPtr ctl) {
         delay(300);  // Debounce
     }
 
-    // Use left joystick for position control
+    // Use left joystick for coarse position control and right joystick for fine-tuning
     if (motorRunning && motorCalibrated) {
-        // Map joystick X axis (-511 to 512) to position (-PI to PI)
+        // Map left joystick X axis (-511 to 512) to position (-PI to PI)
         int axisX = ctl->axisX();
         int axisY = ctl->axisY();
+        int axisRX = ctl->axisRX();  // Right joystick X for fine-tuning
         
-        // Add deadzone
-        if (abs(axisX) > 50 || abs(axisY) > 50) {
-            targetPosition = (float)axisX / 512.0 * PI;
-            // targetVelocity = -(float)axisY / 512.0 * 10.0;  // Max 10 rad/s
-            targetVelocity = 0;
-            
-            Console.printf("Target Pos: %.2f, Vel: %.2f\n", targetPosition, targetVelocity);
-        } else {
-            targetPosition = 0;
-            targetVelocity = 0;
+        float coarsePosition = 0;
+        float finePosition = 0;
+        
+        // Add deadzone for left joystick (coarse control)
+        if (abs(axisX) > 50) {
+            coarsePosition = (float)axisX / 512.0 * PI;  // Full range: -PI to PI
+        }
+        
+        // Add deadzone for right joystick (fine control - 1/10th range)
+        if (abs(axisRX) > 50) {
+            finePosition = (float)axisRX / 512.0 * PI * 0.2;  // Fine range: -PI/10 to PI/10
+        }
+        
+        // Combine coarse and fine positions
+        targetPosition = coarsePosition + finePosition;
+        
+        // Optional: Use left joystick Y for velocity (currently disabled)
+        // targetVelocity = -(float)axisY / 512.0 * 10.0;  // Max 10 rad/s
+        targetVelocity = 0;
+        
+        // Only print if either joystick is moved
+        if (abs(axisX) > 50 || abs(axisRX) > 50) {
+            Console.printf("Coarse: %.2f, Fine: %.2f, Total: %.2f\n", 
+                         coarsePosition, finePosition, targetPosition);
         }
         
         // // Use R1/R2 to adjust Kp
@@ -675,7 +690,8 @@ void setup() {
     Console.println("  B: Run calibration");
     Console.println("  X: Set current position as zero");
     Console.println("  Y: Move to middle position");
-    Console.println("  Left Stick: Position (X) and Velocity (Y) control");
+    Console.println("  Left Stick X: Coarse position control (-PI to PI)");
+    Console.println("  Right Stick X: Fine position tuning (-PI/10 to PI/10)");
     Console.println("  R1/R2: Adjust Kp gain");
     Console.println("  L1/L2: Adjust Kd gain");
 }
