@@ -49,10 +49,14 @@ float lastMotorAngle = 0.0;
 unsigned long lastAngleChangeTime = 0;
 unsigned long crashDetectionStartTime = 0;
 const unsigned long CRASH_DETECTION_TIMEOUT = 2000;  // 2 seconds
-const float POSITION_CHANGE_THRESHOLD = 0.05;  // Minimum position change to consider movement
+const float POSITION_CHANGE_THRESHOLD = 0.2;  // Minimum position change to consider movement
 const float ANGLE_CHANGE_THRESHOLD = 0.02;     // Minimum angle change to detect motor movement
 const float TORQUE_ABNORMAL_THRESHOLD = 25.0;  // Maximum normal torque
 const float TEMPERATURE_LIMIT = 80.0;          // Temperature warning limit
+
+// Controller Rumble Configuration
+const float TORQUE_RUMBLE_THRESHOLD = 0.2;    // Torque level to trigger rumble
+bool isRumbling = false;                        // Track rumble state to avoid repeated commands
 
 // Hall sensor / ADC monitoring
 TLA20XX tla2024(TLA20XX_I2C_ADDR);
@@ -108,6 +112,25 @@ void updateMonitoredValue() {
 //    CONFIG_BLUEPAD32_USB_CONSOLE_ENABLE=n
 
 ControllerPtr myControllers[BP32_MAX_GAMEPADS];
+
+// Controller Rumble Helper Functions
+void setControllerRumble(uint8_t force, uint8_t duration) {
+    // Set rumble on all connected controllers
+    for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
+        if (myControllers[i] && myControllers[i]->isConnected() && myControllers[i]->isGamepad()) {
+            myControllers[i]->setRumble(force, force);  // force: 0-255, duration in units
+        }
+    }
+}
+
+void stopControllerRumble() {
+    // Stop rumble on all connected controllers
+    for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
+        if (myControllers[i] && myControllers[i]->isConnected() && myControllers[i]->isGamepad()) {
+            myControllers[i]->setRumble(0, 0);
+        }
+    }
+}
 
 // Motor Control Helper Functions
 void initMotor() {
@@ -715,6 +738,25 @@ void loop() {
         // Check for motor crash conditions
         if (detectMotorCrash()) {
             handleMotorCrash();
+        }
+        
+        // Check torque and trigger rumble feedback
+        float currentTorque = abs(motorState.torque);
+        if (currentTorque > TORQUE_RUMBLE_THRESHOLD) {
+            if (!isRumbling) {
+                // Calculate rumble intensity based on torque (0-255 scale)
+                // Map torque range to rumble intensity
+                uint8_t rumbleIntensity = (uint8_t)min(255.0, (currentTorque - TORQUE_RUMBLE_THRESHOLD) / (6 - TORQUE_RUMBLE_THRESHOLD) * 255.0);
+                setControllerRumble(rumbleIntensity, 10);
+                isRumbling = true;
+                Console.printf("Rumble ON - Torque: %.2f, Intensity: %d\n", currentTorque, rumbleIntensity);
+            }
+        } else {
+            if (isRumbling) {
+                stopControllerRumble();
+                isRumbling = false;
+                Console.println("Rumble OFF");
+            }
         }
         
         // Get and display motor state periodically
