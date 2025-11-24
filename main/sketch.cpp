@@ -46,11 +46,12 @@ bool enableFilter = false; // true;
 // Motor Crash Detection Variables
 float lastTargetPosition = 0.0;
 float lastMotorAngle = 0.0;
+float motorAngleAtDetectionStart = 0.0;  // Track angle when detection started
 unsigned long lastAngleChangeTime = 0;
 unsigned long crashDetectionStartTime = 0;
 const unsigned long CRASH_DETECTION_TIMEOUT = 2000;  // 2 seconds
 const float POSITION_CHANGE_THRESHOLD = 0.2;  // Minimum position change to consider movement
-const float ANGLE_CHANGE_THRESHOLD = 0.02;     // Minimum angle change to detect motor movement
+const float ANGLE_CHANGE_THRESHOLD = 0.1;     // Cumulative angle change needed during timeout period
 const float TORQUE_ABNORMAL_THRESHOLD = 25.0;  // Maximum normal torque
 const float TEMPERATURE_LIMIT = 80.0;          // Temperature warning limit
 
@@ -304,30 +305,45 @@ bool detectMotorCrash() {
     
     // Check 3: Target position is changing but motor angle is not responding
     float targetChange = abs(targetPosition - lastTargetPosition);
-    float angleChange = abs(motorState.angle - lastMotorAngle);
     
     // If target position changed significantly
     if (targetChange > POSITION_CHANGE_THRESHOLD) {
         if (crashDetectionStartTime == 0) {
-            // Start tracking
+            // Start tracking - record the starting angle
             crashDetectionStartTime = millis();
-        }
-        
-        // Check if motor angle changed
-        if (angleChange > ANGLE_CHANGE_THRESHOLD) {
-            // Motor is responding, reset detection
-            crashDetectionStartTime = 0;
-            lastAngleChangeTime = millis();
+            motorAngleAtDetectionStart = motorState.angle;
+            Console.printf("Crash detection started - Initial angle: %.3f\n", motorAngleAtDetectionStart);
         } else {
-            // Motor not responding, check timeout
-            if (millis() - crashDetectionStartTime > CRASH_DETECTION_TIMEOUT) {
-                Console.printf("CRASH DETECTED: Target changed (%.3f -> %.3f) but motor stuck at %.3f\n",
-                             lastTargetPosition, targetPosition, motorState.angle);
-                return true;
+            // Check cumulative angle change since detection started
+            float cumulativeAngleChange = abs(motorState.angle - motorAngleAtDetectionStart);
+            
+            if (cumulativeAngleChange > ANGLE_CHANGE_THRESHOLD) {
+                // Motor has moved significantly since detection started - reset
+                crashDetectionStartTime = 0;
+                lastAngleChangeTime = millis();
+                Console.printf("Motor responding - Moved %.3f rad, resetting detection\n", cumulativeAngleChange);
+            } else {
+                // Motor not responding enough, check timeout
+                if (millis() - crashDetectionStartTime > CRASH_DETECTION_TIMEOUT) {
+                    Console.printf("CRASH DETECTED: Target changing but motor only moved %.3f rad in %lu ms\n",
+                                 cumulativeAngleChange, millis() - crashDetectionStartTime);
+                    return true;
+                }
             }
         }
+    } else {
+        // Target not changing significantly - reset if we're not already in a detection period
+        // This prevents false positives when making small adjustments
+        if (crashDetectionStartTime != 0) {
+            // Check if motor has reached stable position
+            float cumulativeAngleChange = abs(motorState.angle - motorAngleAtDetectionStart);
+            if (cumulativeAngleChange > ANGLE_CHANGE_THRESHOLD) {
+                // Motor moved sufficiently, safe to reset
+                crashDetectionStartTime = 0;
+            }
+            // If motor didn't move enough, keep the timer running
+        }
     }
-    // Note: Don't reset timer when target stops - keep monitoring until motor responds
     
     // Update last values for next iteration
     lastTargetPosition = targetPosition;
